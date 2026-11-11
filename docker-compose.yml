@@ -1,0 +1,24 @@
+services:
+  n8n:
+    image: n8nio/n8n:2.47.4
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      TZ: UTC
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?Set N8N_ENCRYPTION_KEY}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      CONVEX_SITE_URL: ${CONVEX_SITE_URL:?Set CONVEX_SITE_URL}
+      LENDLOOP_OUTBOUND_WEBHOOK_SECRET: ${LENDLOOP_OUTBOUND_WEBHOOK_SECRET:?Set LENDLOOP_OUTBOUND_WEBHOOK_SECRET}
+      LENDLOOP_INBOUND_WEBHOOK_SECRET: ${LENDLOOP_INBOUND_WEBHOOK_SECRET:?Set LENDLOOP_INBOUND_WEBHOOK_SECRET}
+      NOTIFICATION_WEBHOOK_URL: ${NOTIFICATION_WEBHOOK_URL:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:

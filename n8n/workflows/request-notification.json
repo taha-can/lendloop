@@ -1,0 +1,585 @@
+{
+  "name": "LendLoop request notification",
+  "nodes": [
+    {
+      "id": "setup",
+      "name": "Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        40
+      ],
+      "parameters": {
+        "content": "## Request notification\n\nConvex signs this webhook with `LENDLOOP_OUTBOUND_WEBHOOK_SECRET`.\nThis workflow signs callbacks with `LENDLOOP_INBOUND_WEBHOOK_SECRET`.\n\nBoth values live in the n8n environment, not in this file.\n\nAfter import, set the error workflow to **LendLoop error handler**, then publish. Copy the production URL (`/webhook/lendloop-request`) into the Convex env var `N8N_WEBHOOK_URL`.\n\nOptional: set `NOTIFICATION_WEBHOOK_URL` to a Slack-compatible incoming webhook. The posted body is only `{ text }`.",
+        "height": 260,
+        "width": 420,
+        "color": 4
+      }
+    },
+    {
+      "id": "request-webhook",
+      "name": "Request webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lendloop-request",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "lendloop-request"
+    },
+    {
+      "id": "verify-signature",
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst item = $input.first().json;\nconst payload = item.body && item.headers ? item.body : item;\nconst headers = item.headers || {};\nconst secret = requireSecret(\"LENDLOOP_OUTBOUND_WEBHOOK_SECRET\");\nconst result = verifyRequest({\n  secret,\n  timestamp: headerValue(headers, \"x-lendloop-timestamp\"),\n  signature: headerValue(headers, \"x-lendloop-signature\"),\n  method: \"POST\",\n  path: \"/webhook/lendloop-request\",\n  body: stableStringify(payload),\n});\nreturn [{ json: { signatureValid: result.ok === true, reason: result.ok ? \"\" : result.reason, payload } }];\n"
+      }
+    },
+    {
+      "id": "signature-valid",
+      "name": "Signature valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        940,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "signature-valid",
+              "leftValue": "={{ $json.signatureValid === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "rejected-unsigned-request",
+      "name": "Rejected unsigned request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        480
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "return [{ json: { rejected: true, reason: $json.reason || 'signature rejected' } }];"
+      }
+    },
+    {
+      "id": "sign-claim",
+      "name": "Sign claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst payload = $input.first().json.payload;\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nconst body = stableStringify({ idempotencyKey: payload.idempotencyKey });\nconst timestamp = String(Date.now());\nconst requestPath = \"/automation/claim\";\nreturn [{\n  json: {\n    payload,\n    body,\n    timestamp,\n    signature: signRequest({ secret, timestamp, method: \"POST\", path: requestPath, body }),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "claim-notification",
+      "name": "Claim notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1420,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/automation/claim' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "read-claim",
+      "name": "Read claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst opened = verifyEnvelope({\n  secret: requireSecret(\"LENDLOOP_OUTBOUND_WEBHOOK_SECRET\"),\n  method: \"POST\",\n  path: \"/automation/claim\",\n  envelope: $input.first().json,\n});\nif (!opened.ok) {\n  throw new Error(\"Convex claim response failed signature verification.\");\n}\nreturn [{\n  json: {\n    send: opened.payload && opened.payload.send === true,\n    payload: $(\"Sign claim\").first().json.payload,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "should-send",
+      "name": "Should send",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1900,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "should-send",
+              "leftValue": "={{ $json.send === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "already-delivered",
+      "name": "Already delivered",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "return [{ json: { skipped: true } }];"
+      }
+    },
+    {
+      "id": "compose-notice",
+      "name": "Compose notice",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "\nconst payload = $input.first().json.payload;\nconst who = payload.recipient.name;\nconst other = payload.counterpartyName;\nconst tool = payload.toolName;\nconst range = payload.startDate + \" to \" + payload.endDate;\nlet text = who + \", the request for \" + tool + \" (\" + range + \") was updated.\";\nif (payload.status === \"pending\") text = who + \", \" + other + \" asked to borrow \" + tool + \" from \" + range + \".\";\nif (payload.status === \"approved\") text = who + \", \" + other + \" approved your request for \" + tool + \" (\" + range + \").\";\nif (payload.status === \"declined\") text = who + \", \" + other + \" declined your request for \" + tool + \" (\" + range + \").\";\nif (payload.status === \"cancelled\") text = who + \", the request for \" + tool + \" (\" + range + \") was cancelled.\";\nif (payload.status === \"returned\") text = who + \", \" + other + \" marked \" + tool + \" as returned.\";\nreturn [{ json: { text, idempotencyKey: payload.idempotencyKey } }];\n"
+      }
+    },
+    {
+      "id": "channel-configured",
+      "name": "Channel configured",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2380,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "channel-configured",
+              "leftValue": "={{ Boolean($env.NOTIFICATION_WEBHOOK_URL) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "send-notification",
+      "name": "Send notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2620,
+        40
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NOTIFICATION_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ text: $json.text }) }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "sign-complete",
+      "name": "Sign complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst source = $(\"Compose notice\").first().json;\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nconst body = stableStringify({ idempotencyKey: source.idempotencyKey });\nconst timestamp = String(Date.now());\nconst requestPath = \"/automation/complete\";\nreturn [{\n  json: {\n    body,\n    timestamp,\n    signature: signRequest({ secret, timestamp, method: \"POST\", path: requestPath, body }),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "complete-notification",
+      "name": "Complete notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3100,
+        160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/automation/complete' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "sign-failure",
+      "name": "Sign failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        20
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst source = $(\"Compose notice\").first().json;\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nconst body = stableStringify({\n  idempotencyKey: \"event:\" + source.idempotencyKey + \":failed\",\n  outboxKey: source.idempotencyKey,\n  message: \"Notification delivery failed\",\n});\nconst timestamp = String(Date.now());\nconst requestPath = \"/automation/failure\";\nreturn [{\n  json: {\n    body,\n    timestamp,\n    signature: signRequest({ secret, timestamp, method: \"POST\", path: requestPath, body }),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "report-failure",
+      "name": "Report failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3100,
+        20
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/automation/failure' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Request webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature": {
+      "main": [
+        [
+          {
+            "node": "Signature valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature valid": {
+      "main": [
+        [
+          {
+            "node": "Sign claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rejected unsigned request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign claim": {
+      "main": [
+        [
+          {
+            "node": "Claim notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim notification": {
+      "main": [
+        [
+          {
+            "node": "Read claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read claim": {
+      "main": [
+        [
+          {
+            "node": "Should send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should send": {
+      "main": [
+        [
+          {
+            "node": "Compose notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Already delivered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose notice": {
+      "main": [
+        [
+          {
+            "node": "Channel configured",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Channel configured": {
+      "main": [
+        [
+          {
+            "node": "Send notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sign complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send notification": {
+      "main": [
+        [
+          {
+            "node": "Sign complete",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sign failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign complete": {
+      "main": [
+        [
+          {
+            "node": "Complete notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign failure": {
+      "main": [
+        [
+          {
+            "node": "Report failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

@@ -1,0 +1,640 @@
+{
+  "name": "LendLoop overdue reminders",
+  "nodes": [
+    {
+      "id": "setup",
+      "name": "Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        40
+      ],
+      "parameters": {
+        "content": "## Overdue reminders\n\nRuns every day at 08:00 UTC. It asks Convex for loans whose return date has passed and that have not already been reminded today.\n\nClaiming a reminder is idempotent. A retry will not send a second message for the same loan and day unless the earlier claim is at least 10 minutes old and was not completed.\n\nSet the error workflow to **LendLoop error handler** before publishing.",
+        "height": 260,
+        "width": 420,
+        "color": 4
+      }
+    },
+    {
+      "id": "daily-08-00-utc",
+      "name": "Daily 08:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "sign-overdue-request",
+      "name": "Sign overdue request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nconst timestamp = String(Date.now());\nconst requestPath = \"/overdue\";\nreturn [{\n  json: {\n    timestamp,\n    signature: signRequest({ secret, timestamp, method: \"GET\", path: requestPath, body: \"\" }),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "fetch-overdue-loans",
+      "name": "Fetch overdue loans",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/overdue' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "expand-loans",
+      "name": "Expand loans",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst opened = verifyEnvelope({\n  secret: requireSecret(\"LENDLOOP_OUTBOUND_WEBHOOK_SECRET\"),\n  method: \"GET\",\n  path: \"/overdue\",\n  envelope: $input.first().json,\n});\nif (!opened.ok) {\n  throw new Error(\"Overdue response failed signature verification.\");\n}\nconst loans = opened.payload && Array.isArray(opened.payload.loans) ? opened.payload.loans : [];\nif (loans.length === 0) return [{ json: { empty: true } }];\nreturn loans.map((loan) => ({\n  json: {\n    empty: false,\n    asOf: opened.payload.asOf,\n    loan: {\n      loanId: loan.loanId,\n      idempotencyKey: loan.idempotencyKey,\n      toolName: loan.toolName,\n      dueDate: loan.dueDate,\n      borrowerName: loan.borrowerName,\n    },\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "has-loans",
+      "name": "Has loans",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1420,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-loans",
+              "leftValue": "={{ $json.empty !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "no-loans-today",
+      "name": "No loans today",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        460
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "return [{ json: { done: true, reminded: 0 } }];"
+      }
+    },
+    {
+      "id": "sign-reminder-claim",
+      "name": "Sign reminder claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nreturn $input.all().filter((item) => item.json.empty !== true).map((item) => {\n  const body = stableStringify({\n    phase: \"claim\",\n    idempotencyKey: item.json.loan.idempotencyKey,\n    loanId: item.json.loan.loanId,\n    reminderDate: item.json.asOf,\n  });\n  const timestamp = String(Date.now());\n  const requestPath = \"/reminders\";\n  return {\n    json: {\n      loan: item.json.loan,\n      asOf: item.json.asOf,\n      body,\n      timestamp,\n      signature: signRequest({ secret, timestamp, method: \"POST\", path: requestPath, body }),\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "claim-reminder",
+      "name": "Claim reminder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1900,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/reminders' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "read-reminder-claim",
+      "name": "Read reminder claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst prior = $(\"Sign reminder claim\").all();\nreturn $input.all().map((item, index) => {\n  const opened = verifyEnvelope({\n    secret: requireSecret(\"LENDLOOP_OUTBOUND_WEBHOOK_SECRET\"),\n    method: \"POST\",\n    path: \"/reminders\",\n    envelope: item.json,\n  });\n  if (!opened.ok) {\n    throw new Error(\"Reminder claim response failed signature verification.\");\n  }\n  const source = prior[index] ? prior[index].json : {};\n  return {\n    json: {\n      send: opened.payload && opened.payload.send === true,\n      loan: source.loan,\n      asOf: source.asOf,\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "should-remind",
+      "name": "Should remind",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2380,
+        220
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "should-remind",
+              "leftValue": "={{ $json.send === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "compose-reminder",
+      "name": "Compose reminder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        140
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "\nreturn $input.all().filter((item) => item.json.send === true).map((item) => {\n  const loan = item.json.loan;\n  const text = loan.borrowerName + \", \" + loan.toolName + \" was due back on \" + loan.dueDate + \". Please return it or message the owner.\";\n  return { json: { text, loan, asOf: item.json.asOf } };\n});\n"
+      }
+    },
+    {
+      "id": "channel-configured",
+      "name": "Channel configured",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2860,
+        140
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "channel-configured",
+              "leftValue": "={{ Boolean($env.NOTIFICATION_WEBHOOK_URL) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "send-reminder",
+      "name": "Send reminder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3100,
+        40
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NOTIFICATION_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ text: $json.text }) }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "sign-reminder-complete",
+      "name": "Sign reminder complete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3340,
+        180
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst source = $(\"Compose reminder\").item.json;\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nconst body = stableStringify({\n  phase: \"complete\",\n  idempotencyKey: source.loan.idempotencyKey,\n  loanId: source.loan.loanId,\n  reminderDate: source.asOf,\n});\nconst timestamp = String(Date.now());\nconst requestPath = \"/reminders\";\nreturn {\n  json: {\n    body,\n    timestamp,\n    signature: signRequest({ secret, timestamp, method: \"POST\", path: requestPath, body }),\n  },\n};\n"
+      }
+    },
+    {
+      "id": "complete-reminder",
+      "name": "Complete reminder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3580,
+        180
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/reminders' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "sign-reminder-failure",
+      "name": "Sign reminder failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3340,
+        40
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "function stableStringify(value) {\n  if (value === undefined) {\n    throw new Error(\"Cannot encode undefined\");\n  }\n  if (value === null || typeof value !== \"object\") {\n    const encoded = JSON.stringify(value);\n    if (encoded === undefined) {\n      throw new Error(\"Cannot encode value\");\n    }\n    return encoded;\n  }\n  if (Array.isArray(value)) {\n    return `[${value.map((item) => stableStringify(item)).join(\",\")}]`;\n  }\n  const keys = Object.keys(value)\n    .filter((key) => value[key] !== undefined)\n    .sort();\n  return `{${keys\n    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)\n    .join(\",\")}}`;\n}\n\nfunction sha256Hex(value) {\n  return require(\"crypto\").createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\");\n}\n\nfunction signRequest({ secret, timestamp, method, path, body }) {\n  const canonical = `${timestamp}.${method.toUpperCase()}.${path}.${sha256Hex(body)}`;\n  const mac = require(\"crypto\")\n    .createHmac(\"sha256\", secret)\n    .update(canonical, \"utf8\")\n    .digest(\"hex\");\n  return `v1=${mac}`;\n}\n\nfunction timingSafeEqual(left, right) {\n  const crypto = require(\"crypto\");\n  const a = Buffer.from(left);\n  const b = Buffer.from(right);\n  if (a.length !== b.length) return false;\n  return crypto.timingSafeEqual(a, b);\n}\n\nfunction verifyRequest({ secret, timestamp, signature, method, path, body, now }) {\n  if (!secret || !timestamp || !signature) return { ok: false, reason: \"missing\" };\n  if (!/^\\d{10,16}$/.test(String(timestamp))) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  if (!String(signature).startsWith(\"v1=\")) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const current = typeof now === \"number\" ? now : Date.now();\n  const parsed = Number(timestamp);\n  if (!Number.isFinite(parsed) || Math.abs(current - parsed) > 5 * 60 * 1000) {\n    return { ok: false, reason: \"stale\" };\n  }\n  const expected = signRequest({\n    secret,\n    timestamp: String(timestamp),\n    method,\n    path,\n    body,\n  });\n  if (!timingSafeEqual(expected, String(signature))) {\n    return { ok: false, reason: \"mismatch\" };\n  }\n  return { ok: true };\n}\n\nfunction verifyEnvelope({ secret, method, path, envelope, now }) {\n  if (\n    !envelope ||\n    typeof envelope.timestamp !== \"string\" ||\n    typeof envelope.signature !== \"string\"\n  ) {\n    return { ok: false, reason: \"malformed\" };\n  }\n  const result = verifyRequest({\n    secret,\n    timestamp: envelope.timestamp,\n    signature: envelope.signature,\n    method,\n    path,\n    body: stableStringify(envelope.payload ?? null),\n    now,\n  });\n  if (!result.ok) return result;\n  return { ok: true, payload: envelope.payload };\n}\n\nfunction headerValue(headers, name) {\n  if (!headers || typeof headers !== \"object\") return \"\";\n  const target = name.toLowerCase();\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() !== target) continue;\n    const value = headers[key];\n    return Array.isArray(value) ? String(value[0] ?? \"\") : String(value ?? \"\");\n  }\n  return \"\";\n}\n\nfunction requireSecret(name) {\n  const secret = $env[name];\n  if (!secret || String(secret).length < 16) {\n    throw new Error(`${name} is not set on the n8n instance.`);\n  }\n  return String(secret);\n}\n\n\nconst source = $(\"Compose reminder\").item.json;\nconst secret = requireSecret(\"LENDLOOP_INBOUND_WEBHOOK_SECRET\");\nconst body = stableStringify({\n  phase: \"fail\",\n  idempotencyKey: source.loan.idempotencyKey,\n  loanId: source.loan.loanId,\n  reminderDate: source.asOf,\n  message: \"Reminder delivery failed\",\n});\nconst timestamp = String(Date.now());\nconst requestPath = \"/reminders\";\nreturn {\n  json: {\n    body,\n    timestamp,\n    signature: signRequest({ secret, timestamp, method: \"POST\", path: requestPath, body }),\n  },\n};\n"
+      }
+    },
+    {
+      "id": "record-reminder-failure",
+      "name": "Record reminder failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3580,
+        40
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL.replace(/\\/$/, '') + '/reminders' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Daily 08:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign overdue request": {
+      "main": [
+        [
+          {
+            "node": "Fetch overdue loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch overdue loans": {
+      "main": [
+        [
+          {
+            "node": "Expand loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand loans": {
+      "main": [
+        [
+          {
+            "node": "Has loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has loans": {
+      "main": [
+        [
+          {
+            "node": "Sign reminder claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No loans today",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign reminder claim": {
+      "main": [
+        [
+          {
+            "node": "Claim reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim reminder": {
+      "main": [
+        [
+          {
+            "node": "Read reminder claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read reminder claim": {
+      "main": [
+        [
+          {
+            "node": "Should remind",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should remind": {
+      "main": [
+        [
+          {
+            "node": "Compose reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose reminder": {
+      "main": [
+        [
+          {
+            "node": "Channel configured",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Channel configured": {
+      "main": [
+        [
+          {
+            "node": "Send reminder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sign reminder complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reminder": {
+      "main": [
+        [
+          {
+            "node": "Sign reminder complete",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sign reminder failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign reminder complete": {
+      "main": [
+        [
+          {
+            "node": "Complete reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign reminder failure": {
+      "main": [
+        [
+          {
+            "node": "Record reminder failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
